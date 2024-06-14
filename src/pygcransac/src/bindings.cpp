@@ -849,6 +849,44 @@ py::tuple findHomography(py::array_t<double>  correspondences_,
 			neighborhood_size,
 			sampler_variance,
 			lo_number);
+	else if (solver == 3) // Two ScaOri-based homography estimation
+		num_inl = findHomographyTwoScaOri_(
+			correspondences,
+			probabilities,
+			inliers,
+			H,
+			h1, w1, h2, w2,
+			spatial_coherence_weight,
+			threshold,
+			conf,
+			max_iters,
+			min_iters,
+			use_sprt,
+			min_inlier_ratio_for_sprt,
+			sampler,
+			neighborhood,
+			neighborhood_size,
+			sampler_variance,
+			lo_number);
+	else if (solver == 4) // One SIFT-based homography estimation
+		num_inl = findHomographyOneSIFT_(
+			correspondences,
+			probabilities,
+			inliers,
+			H,
+			h1, w1, h2, w2,
+			spatial_coherence_weight,
+			threshold,
+			conf,
+			max_iters,
+			min_iters,
+			use_sprt,
+			min_inlier_ratio_for_sprt,
+			sampler,
+			neighborhood,
+			neighborhood_size,
+			sampler_variance,
+			lo_number);
 
     py::array_t<bool> inliers_ = py::array_t<bool>(NUM_TENTS);
     py::buffer_info buf3 = inliers_.request();

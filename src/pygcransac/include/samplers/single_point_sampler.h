@@ -58,7 +58,7 @@ namespace gcransac
 
 		public:
 			explicit SinglePointSampler(const cv::Mat * const container_,
-				const size_t step_size_ = 10)
+				const size_t step_size_ = 1)
 				: Sampler(container_),
 				current_index(0),
 				current_offset(0),

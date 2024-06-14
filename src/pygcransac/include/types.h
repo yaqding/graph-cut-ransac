@@ -66,6 +66,8 @@
 #include "estimators/solver_homography_four_point.h"
 #include "estimators/solver_homography_two_affine.h"
 #include "estimators/solver_homography_two_sift.h"
+#include "estimators/solver_homography_two_scaori.h"
+#include "estimators/solver_homography_one_sift.h"
 #include "estimators/solver_homography_bundle_adjustment.h"
 #include "estimators/solver_radial_homography_5pc.h"
 #include "estimators/solver_radial_homography_6pc.h"
@@ -103,6 +105,16 @@ namespace gcransac
 		typedef estimator::RobustHomographyEstimator<estimator::solver::HomographyTwoSIFTSolver, // The solver used for fitting a model to a minimal sample
 			estimator::solver::HomographyFourPointSolver> // The solver used for fitting a model to a non-minimal sample
 			SIFTBasedHomographyEstimator;
+
+		// The default estimator for homography fitting
+		typedef estimator::RobustHomographyEstimator<estimator::solver::HomographyTwoScaOriSolver, // The solver used for fitting a model to a minimal sample
+			estimator::solver::HomographyFourPointSolver> // The solver used for fitting a model to a non-minimal sample
+			TwoScaOriBasedHomographyEstimator;
+
+		// The default estimator for homography fitting
+		typedef estimator::RobustHomographyEstimator<estimator::solver::HomographyOneSIFTSolver, // The solver used for fitting a model to a minimal sample
+			estimator::solver::HomographyFourPointSolver> // The solver used for fitting a model to a non-minimal sample
+			OneSIFTBasedHomographyEstimator;
 
 		// The default estimator for essential matrix fitting
 		typedef estimator::EssentialMatrixEstimator<estimator::solver::EssentialMatrixFivePointNisterSolver, // The solver used for fitting a model to a minimal sample

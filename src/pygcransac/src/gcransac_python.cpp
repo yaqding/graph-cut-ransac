@@ -15,6 +15,7 @@
 #include "samplers/progressive_napsac_sampler.h"
 #include "samplers/importance_sampler.h"
 #include "samplers/adaptive_reordering_sampler.h"
+#include "samplers/single_point_sampler.h"
 
 #include "estimators/fundamental_estimator.h"
 #include "estimators/homography_estimator.h"
@@ -4257,6 +4258,496 @@ int findHomographySIFT_(
 			MSACScoringFunction<utils::SIFTBasedHomographyEstimator>,
 			preemption::EmptyPreemptiveVerfication<utils::SIFTBasedHomographyEstimator>,
 			inlier_selector::EmptyInlierSelector<utils::SIFTBasedHomographyEstimator, AbstractNeighborhood>> gcransac;
+		gcransac.settings.threshold = threshold; // The inlier-outlier threshold
+		gcransac.settings.spatial_coherence_weight = spatial_coherence_weight; // The weight of the spatial coherence term
+		gcransac.settings.confidence = conf; // The required confidence in the results
+		gcransac.settings.max_local_optimization_number = lo_number; // The maximum number of local optimizations
+		gcransac.settings.max_iteration_number = max_iters; // The maximum number of iterations
+		gcransac.settings.min_iteration_number = min_iters; // The minimum number of iterations
+		gcransac.settings.neighborhood_sphere_radius = cell_number_in_neighborhood_graph_; // The radius of the neighborhood ball
+
+		// Start GC-RANSAC
+		gcransac.run(points,
+			estimator,
+			main_sampler.get(),
+			&local_optimization_sampler,
+			neighborhood_graph.get(),
+			model,
+			preemptive_verification,
+			inlier_selector);
+
+		statistics = gcransac.getRansacStatistics();
+	}
+
+	homography.resize(9);
+
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			homography[i * 3 + j] = model.descriptor(i, j);
+		}
+	}
+
+	inliers.resize(num_tents);
+
+	const int num_inliers = statistics.inliers.size();
+	for (auto pt_idx = 0; pt_idx < num_tents; ++pt_idx) {
+		inliers[pt_idx] = 0;
+
+	}
+	for (auto pt_idx = 0; pt_idx < num_inliers; ++pt_idx) {
+		inliers[statistics.inliers[pt_idx]] = 1;
+	}
+
+	// It is ugly: the unique_ptr does not check for virtual descructors in the base class.
+	// Therefore, the derived class's objects are not deleted automatically. 
+	// This causes a memory leaking. I hate C++.
+	AbstractSampler *sampler_ptr = main_sampler.release();
+	delete sampler_ptr;
+
+	AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+	delete neighborhood_graph_ptr;
+
+	// Return the number of inliers found
+	return num_inliers;
+}
+
+// A method for estimating a homography matrix given 2D-2D correspondences
+int findHomographyTwoScaOri_(
+	// The 2D-2D point correspondences.
+	std::vector<double>& correspondences,
+	// The probabilities for each 3D-3D point correspondence if available
+	std::vector<double> &point_probabilities,
+	// Output: the found inliers 
+	std::vector<bool>& inliers, 
+	// Output: the found 6D pose
+	std::vector<double> &homography, 
+	// The images' sizes
+	int h1, int w1, int h2, int w2,
+	// The spatial coherence weight used in the local optimization
+	double spatial_coherence_weight, 
+	// The inlier-outlier threshold
+	double threshold, 
+	// The RANSAC confidence. Typical values are 0.95, 0.99.
+	double conf,
+	// Maximum iteration number. I do not suggest setting it to lower than 1000.
+	int max_iters,
+	// Minimum iteration number. I do not suggest setting it to lower than 50.
+	int min_iters,
+	// A flag to decide if SPRT should be used to speed up the model verification. 
+	// It is not suggested if the inlier ratio is expected to be very low - it will fail in that case.
+	// Otherwise, it leads to a significant speed-up. 
+	bool use_sprt, 
+	// Expected inlier ratio for SPRT. Default: 0.1
+	double min_inlier_ratio_for_sprt,
+	// The identifier of the used sampler. 
+	// Options: 
+	//	(0) Uniform sampler 
+	// 	(1) PROSAC sampler. The correspondences should be ordered by quality (e.g., SNN ratio) prior to calling this function. 
+	//	(2) Progressive NAPSAC sampler. The correspondences should be ordered by quality (e.g., SNN ratio) prior to calling this function. 
+	//	(3) Importance sampler from NG-RANSAC. The point probabilities should be provided.
+	//	(4) Adaptive re-ordering sampler from Deep MAGSAC++. The point probabilities should be provided. 
+	int sampler_id,
+	// The identifier of the used neighborhood structure. 
+	// 	(0) FLANN-based neighborhood. 
+	// 	(1) Grid-based neighborhood.
+	int neighborhood_id,
+	// The size of the neighborhood.
+	// If (0) FLANN is used, the size if the Euclidean distance in the correspondence space
+	// If (1) Grid is used, the size is the division number, e.g., 2 if we want to divide the image to 2 in along each axes (2*2 = 4 cells in total)
+	double neighborhood_size,
+	// The variance parameter of the AR-Sampler. It is only used if that particular sampler is selected.
+	double sampler_variance,
+	// The number of RANSAC iterations done in the local optimization
+	int lo_number)
+{
+	int num_tents = correspondences.size() / 8;
+	cv::Mat points(num_tents, 8, CV_64F, &correspondences[0]);
+	
+	typedef neighborhood::NeighborhoodGraph<cv::Mat> AbstractNeighborhood;
+	std::unique_ptr<AbstractNeighborhood> neighborhood_graph;
+
+	const size_t cell_number_in_neighborhood_graph_ = 
+		static_cast<size_t>(neighborhood_size);
+
+	// If the spatial weight is 0.0, the neighborhood graph should not be created 
+	if (spatial_coherence_weight <= std::numeric_limits<double>::epsilon())
+	{
+		cv::Mat empty_point_matrix(0, 4, CV_64F);
+
+		neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+			new neighborhood::GridNeighborhoodGraph<4>(&empty_point_matrix, // The input points
+			{ 	0, // The cell size along axis X in the source image
+				0, // The cell size along axis Y in the source image
+				0, // The cell size along axis X in the destination image
+				0 }, // The cell size along axis Y in the destination image
+			1)); // The cell number along every axis
+	} else // Initializing a grid-based neighborhood graph
+	{
+		// Using only the point coordinates and not the affine elements when constructing the neighborhood.
+		cv::Mat point_coordinates = points(cv::Rect(0, 0, 4, points.rows));
+
+		// Initializing a grid-based neighborhood graph
+		if (neighborhood_id == 0)
+			neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+				new neighborhood::GridNeighborhoodGraph<4>(&point_coordinates,
+				{ w1 / neighborhood_size,
+					h1 / neighborhood_size,
+					w2 / neighborhood_size,
+					h2 / neighborhood_size },
+				static_cast<size_t>(neighborhood_size)));
+		else if (neighborhood_id == 1) // Initializing the neighbhood graph by FLANN
+			neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+				new neighborhood::FlannNeighborhoodGraph(&point_coordinates, neighborhood_size));
+		else
+		{
+			fprintf(stderr, "Unknown neighborhood-graph identifier: %d. The accepted values are 0 (Grid-based), 1 (FLANN-based neighborhood)\n",
+				neighborhood_id);
+			return 0;
+		}
+
+		// Checking if the neighborhood graph is initialized successfully.
+		if (!neighborhood_graph->isInitialized())
+		{
+			AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+			delete neighborhood_graph_ptr;
+
+			fprintf(stderr, "The neighborhood graph is not initialized successfully.\n");
+			return 0;
+		}
+	}
+
+	utils::TwoScaOriBasedHomographyEstimator estimator;
+	Homography model;
+
+	// Initialize the samplers
+	// The main sampler is used for sampling in the main RANSAC loop
+	typedef sampler::Sampler<cv::Mat, size_t> AbstractSampler;
+	std::unique_ptr<AbstractSampler> main_sampler;
+	if (sampler_id == 0) // Initializing a RANSAC-like uniformly random sampler
+		main_sampler = std::unique_ptr<AbstractSampler>(new sampler::UniformSampler(&points));
+	else if (sampler_id == 1)  // Initializing a PROSAC sampler. This requires the points to be ordered according to the quality.
+		main_sampler = std::unique_ptr<AbstractSampler>(new sampler::ProsacSampler(&points, estimator.sampleSize()));
+	else if (sampler_id == 3)
+		main_sampler = std::unique_ptr<AbstractSampler>(new gcransac::sampler::ImportanceSampler(&points, 
+            point_probabilities,
+            estimator.sampleSize()));
+	else if (sampler_id == 4)
+    {
+        double max_prob = 0;
+        for (const auto &prob : point_probabilities)
+            max_prob = MAX(max_prob, prob);
+        for (auto &prob : point_probabilities)
+            prob /= max_prob;
+		main_sampler = std::unique_ptr<AbstractSampler>(new gcransac::sampler::AdaptiveReorderingSampler(&points, 
+            point_probabilities,
+            estimator.sampleSize(),
+            sampler_variance));
+	}
+	else
+	{
+		AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+		delete neighborhood_graph_ptr;
+
+		fprintf(stderr, "Unknown sampler identifier: %d. The accepted samplers are 0 (uniform sampling), 1 (PROSAC sampling), 3 (NG-RANSAC sampling), 4 (AR-Sampler)\n",
+			sampler_id);
+		return 0;
+	}
+
+	sampler::UniformSampler local_optimization_sampler(&points); // The local optimization sampler is used inside the local optimization
+
+	// Checking if the samplers are initialized successfully.
+	if (!main_sampler->isInitialized() ||
+		!local_optimization_sampler.isInitialized())
+	{
+		// It is ugly: the unique_ptr does not check for virtual descructors in the base class.
+		// Therefore, the derived class's objects are not deleted automatically. 
+		// This causes a memory leaking. I hate C++.
+		AbstractSampler *sampler_ptr = main_sampler.release();
+		delete sampler_ptr;
+
+		AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+		delete neighborhood_graph_ptr;
+
+		fprintf(stderr, "One of the samplers is not initialized successfully.\n");
+		return 0;
+	}
+
+	utils::RANSACStatistics statistics;
+	inlier_selector::EmptyInlierSelector<utils::TwoScaOriBasedHomographyEstimator, AbstractNeighborhood> inlier_selector(neighborhood_graph.get());
+
+	if (use_sprt)
+	{
+		// Initializing SPRT test
+		preemption::SPRTPreemptiveVerfication<utils::TwoScaOriBasedHomographyEstimator> preemptive_verification(
+			points,
+			estimator);
+
+		GCRANSAC<utils::TwoScaOriBasedHomographyEstimator,
+			AbstractNeighborhood,
+			MSACScoringFunction<utils::TwoScaOriBasedHomographyEstimator>,
+			preemption::SPRTPreemptiveVerfication<utils::TwoScaOriBasedHomographyEstimator>,
+			inlier_selector::EmptyInlierSelector<utils::TwoScaOriBasedHomographyEstimator, AbstractNeighborhood>> gcransac;
+		gcransac.settings.threshold = threshold; // The inlier-outlier threshold
+		gcransac.settings.spatial_coherence_weight = spatial_coherence_weight; // The weight of the spatial coherence term
+		gcransac.settings.confidence = conf; // The required confidence in the results
+		gcransac.settings.max_local_optimization_number = lo_number; // The maximum number of local optimizations
+		gcransac.settings.max_iteration_number = max_iters; // The maximum number of iterations
+		gcransac.settings.min_iteration_number = min_iters; // The minimum number of iterations
+		gcransac.settings.neighborhood_sphere_radius = neighborhood_size; // The radius of the neighborhood ball
+
+		// Start GC-RANSAC
+		gcransac.run(points,
+			estimator,
+			main_sampler.get(),
+			&local_optimization_sampler,
+			neighborhood_graph.get(),
+			model,
+			preemptive_verification,
+			inlier_selector);
+
+		statistics = gcransac.getRansacStatistics();
+	}
+	else
+	{
+		// Initializing an empty preemption
+		preemption::EmptyPreemptiveVerfication<utils::TwoScaOriBasedHomographyEstimator> preemptive_verification;
+
+		GCRANSAC<utils::TwoScaOriBasedHomographyEstimator,
+			AbstractNeighborhood,
+			MSACScoringFunction<utils::TwoScaOriBasedHomographyEstimator>,
+			preemption::EmptyPreemptiveVerfication<utils::TwoScaOriBasedHomographyEstimator>,
+			inlier_selector::EmptyInlierSelector<utils::TwoScaOriBasedHomographyEstimator, AbstractNeighborhood>> gcransac;
+		gcransac.settings.threshold = threshold; // The inlier-outlier threshold
+		gcransac.settings.spatial_coherence_weight = spatial_coherence_weight; // The weight of the spatial coherence term
+		gcransac.settings.confidence = conf; // The required confidence in the results
+		gcransac.settings.max_local_optimization_number = lo_number; // The maximum number of local optimizations
+		gcransac.settings.max_iteration_number = max_iters; // The maximum number of iterations
+		gcransac.settings.min_iteration_number = min_iters; // The minimum number of iterations
+		gcransac.settings.neighborhood_sphere_radius = cell_number_in_neighborhood_graph_; // The radius of the neighborhood ball
+
+		// Start GC-RANSAC
+		gcransac.run(points,
+			estimator,
+			main_sampler.get(),
+			&local_optimization_sampler,
+			neighborhood_graph.get(),
+			model,
+			preemptive_verification,
+			inlier_selector);
+
+		statistics = gcransac.getRansacStatistics();
+	}
+
+	homography.resize(9);
+
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			homography[i * 3 + j] = model.descriptor(i, j);
+		}
+	}
+
+	inliers.resize(num_tents);
+
+	const int num_inliers = statistics.inliers.size();
+	for (auto pt_idx = 0; pt_idx < num_tents; ++pt_idx) {
+		inliers[pt_idx] = 0;
+
+	}
+	for (auto pt_idx = 0; pt_idx < num_inliers; ++pt_idx) {
+		inliers[statistics.inliers[pt_idx]] = 1;
+	}
+
+	// It is ugly: the unique_ptr does not check for virtual descructors in the base class.
+	// Therefore, the derived class's objects are not deleted automatically. 
+	// This causes a memory leaking. I hate C++.
+	AbstractSampler *sampler_ptr = main_sampler.release();
+	delete sampler_ptr;
+
+	AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+	delete neighborhood_graph_ptr;
+
+	// Return the number of inliers found
+	return num_inliers;
+}
+
+// A method for estimating a homography matrix given 2D-2D correspondences
+int findHomographyOneSIFT_(
+	// The 2D-2D point correspondences.
+	std::vector<double>& correspondences,
+	// The probabilities for each 3D-3D point correspondence if available
+	std::vector<double> &point_probabilities,
+	// Output: the found inliers 
+	std::vector<bool>& inliers, 
+	// Output: the found 6D pose
+	std::vector<double> &homography, 
+	// The images' sizes
+	int h1, int w1, int h2, int w2,
+	// The spatial coherence weight used in the local optimization
+	double spatial_coherence_weight, 
+	// The inlier-outlier threshold
+	double threshold, 
+	// The RANSAC confidence. Typical values are 0.95, 0.99.
+	double conf,
+	// Maximum iteration number. I do not suggest setting it to lower than 1000.
+	int max_iters,
+	// Minimum iteration number. I do not suggest setting it to lower than 50.
+	int min_iters,
+	// A flag to decide if SPRT should be used to speed up the model verification. 
+	// It is not suggested if the inlier ratio is expected to be very low - it will fail in that case.
+	// Otherwise, it leads to a significant speed-up. 
+	bool use_sprt, 
+	// Expected inlier ratio for SPRT. Default: 0.1
+	double min_inlier_ratio_for_sprt,
+	// The identifier of the used sampler. 
+	// Options: 
+	//	(0) Uniform sampler 
+	// 	(1) PROSAC sampler. The correspondences should be ordered by quality (e.g., SNN ratio) prior to calling this function. 
+	//	(2) Progressive NAPSAC sampler. The correspondences should be ordered by quality (e.g., SNN ratio) prior to calling this function. 
+	//	(3) Importance sampler from NG-RANSAC. The point probabilities should be provided.
+	//	(4) Adaptive re-ordering sampler from Deep MAGSAC++. The point probabilities should be provided. 
+	int sampler_id,
+	// The identifier of the used neighborhood structure. 
+	// 	(0) FLANN-based neighborhood. 
+	// 	(1) Grid-based neighborhood.
+	int neighborhood_id,
+	// The size of the neighborhood.
+	// If (0) FLANN is used, the size if the Euclidean distance in the correspondence space
+	// If (1) Grid is used, the size is the division number, e.g., 2 if we want to divide the image to 2 in along each axes (2*2 = 4 cells in total)
+	double neighborhood_size,
+	// The variance parameter of the AR-Sampler. It is only used if that particular sampler is selected.
+	double sampler_variance,
+	// The number of RANSAC iterations done in the local optimization
+	int lo_number)
+{
+	int num_tents = correspondences.size() / 8;
+	cv::Mat points(num_tents, 8, CV_64F, &correspondences[0]);
+	
+	typedef neighborhood::NeighborhoodGraph<cv::Mat> AbstractNeighborhood;
+	std::unique_ptr<AbstractNeighborhood> neighborhood_graph;
+
+	const size_t cell_number_in_neighborhood_graph_ = 
+		static_cast<size_t>(neighborhood_size);
+
+	// If the spatial weight is 0.0, the neighborhood graph should not be created 
+	if (spatial_coherence_weight <= std::numeric_limits<double>::epsilon())
+	{
+		cv::Mat empty_point_matrix(0, 4, CV_64F);
+
+		neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+			new neighborhood::GridNeighborhoodGraph<4>(&empty_point_matrix, // The input points
+			{ 	0, // The cell size along axis X in the source image
+				0, // The cell size along axis Y in the source image
+				0, // The cell size along axis X in the destination image
+				0 }, // The cell size along axis Y in the destination image
+			1)); // The cell number along every axis
+	} else // Initializing a grid-based neighborhood graph
+	{
+		// Using only the point coordinates and not the affine elements when constructing the neighborhood.
+		cv::Mat point_coordinates = points(cv::Rect(0, 0, 4, points.rows));
+
+		// Initializing a grid-based neighborhood graph
+		if (neighborhood_id == 0)
+			neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+				new neighborhood::GridNeighborhoodGraph<4>(&point_coordinates,
+				{ w1 / neighborhood_size,
+					h1 / neighborhood_size,
+					w2 / neighborhood_size,
+					h2 / neighborhood_size },
+				static_cast<size_t>(neighborhood_size)));
+		else if (neighborhood_id == 1) // Initializing the neighbhood graph by FLANN
+			neighborhood_graph = std::unique_ptr<AbstractNeighborhood>(
+				new neighborhood::FlannNeighborhoodGraph(&point_coordinates, neighborhood_size));
+		else
+		{
+			fprintf(stderr, "Unknown neighborhood-graph identifier: %d. The accepted values are 0 (Grid-based), 1 (FLANN-based neighborhood)\n",
+				neighborhood_id);
+			return 0;
+		}
+
+		// Checking if the neighborhood graph is initialized successfully.
+		if (!neighborhood_graph->isInitialized())
+		{
+			AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+			delete neighborhood_graph_ptr;
+
+			fprintf(stderr, "The neighborhood graph is not initialized successfully.\n");
+			return 0;
+		}
+	}
+
+	utils::OneSIFTBasedHomographyEstimator estimator;
+	Homography model;
+
+	// Initialize the samplers
+	// The main sampler is used for sampling in the main RANSAC loop
+	typedef sampler::Sampler<cv::Mat, size_t> AbstractSampler;
+	std::unique_ptr<AbstractSampler> main_sampler;
+	main_sampler = std::unique_ptr<AbstractSampler>(new sampler::SinglePointSampler(&points));
+
+	sampler::UniformSampler local_optimization_sampler(&points); // The local optimization sampler is used inside the local optimization
+
+	// Checking if the samplers are initialized successfully.
+	if (!main_sampler->isInitialized() ||
+		!local_optimization_sampler.isInitialized())
+	{
+		// It is ugly: the unique_ptr does not check for virtual descructors in the base class.
+		// Therefore, the derived class's objects are not deleted automatically. 
+		// This causes a memory leaking. I hate C++.
+		AbstractSampler *sampler_ptr = main_sampler.release();
+		delete sampler_ptr;
+
+		AbstractNeighborhood *neighborhood_graph_ptr = neighborhood_graph.release();
+		delete neighborhood_graph_ptr;
+
+		fprintf(stderr, "One of the samplers is not initialized successfully.\n");
+		return 0;
+	}
+
+	utils::RANSACStatistics statistics;
+	inlier_selector::EmptyInlierSelector<utils::OneSIFTBasedHomographyEstimator, AbstractNeighborhood> inlier_selector(neighborhood_graph.get());
+
+	if (use_sprt)
+	{
+		// Initializing SPRT test
+		preemption::SPRTPreemptiveVerfication<utils::OneSIFTBasedHomographyEstimator> preemptive_verification(
+			points,
+			estimator);
+
+		GCRANSAC<utils::OneSIFTBasedHomographyEstimator,
+			AbstractNeighborhood,
+			MSACScoringFunction<utils::OneSIFTBasedHomographyEstimator>,
+			preemption::SPRTPreemptiveVerfication<utils::OneSIFTBasedHomographyEstimator>,
+			inlier_selector::EmptyInlierSelector<utils::OneSIFTBasedHomographyEstimator, AbstractNeighborhood>> gcransac;
+		gcransac.settings.threshold = threshold; // The inlier-outlier threshold
+		gcransac.settings.spatial_coherence_weight = spatial_coherence_weight; // The weight of the spatial coherence term
+		gcransac.settings.confidence = conf; // The required confidence in the results
+		gcransac.settings.max_local_optimization_number = lo_number; // The maximum number of local optimizations
+		gcransac.settings.max_iteration_number = max_iters; // The maximum number of iterations
+		gcransac.settings.min_iteration_number = min_iters; // The minimum number of iterations
+		gcransac.settings.neighborhood_sphere_radius = neighborhood_size; // The radius of the neighborhood ball
+
+		// Start GC-RANSAC
+		gcransac.run(points,
+			estimator,
+			main_sampler.get(),
+			&local_optimization_sampler,
+			neighborhood_graph.get(),
+			model,
+			preemptive_verification,
+			inlier_selector);
+
+		statistics = gcransac.getRansacStatistics();
+	}
+	else
+	{
+		// Initializing an empty preemption
+		preemption::EmptyPreemptiveVerfication<utils::OneSIFTBasedHomographyEstimator> preemptive_verification;
+
+		GCRANSAC<utils::OneSIFTBasedHomographyEstimator,
+			AbstractNeighborhood,
+			MSACScoringFunction<utils::OneSIFTBasedHomographyEstimator>,
+			preemption::EmptyPreemptiveVerfication<utils::OneSIFTBasedHomographyEstimator>,
+			inlier_selector::EmptyInlierSelector<utils::OneSIFTBasedHomographyEstimator, AbstractNeighborhood>> gcransac;
 		gcransac.settings.threshold = threshold; // The inlier-outlier threshold
 		gcransac.settings.spatial_coherence_weight = spatial_coherence_weight; // The weight of the spatial coherence term
 		gcransac.settings.confidence = conf; // The required confidence in the results

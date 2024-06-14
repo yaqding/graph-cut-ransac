@@ -4,6 +4,8 @@ class Solver(Enum):
     PointBased = 0
     SIFTBased = 1
     AffineBased = 2
+    TwoScaOriBased = 3
+    OneSIFTBased = 4
 
 class Sampler(Enum):
     Uniform = 0
